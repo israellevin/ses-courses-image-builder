@@ -60,7 +60,7 @@ create_chroot(){(
 wait
 
 # Install software on the chroot.
-install_chroot(){
+install_chroot(){(
     cd "$chroot_dir"
     echo 'APT::Install-Recommends "0";' > etc/apt/apt.conf.d/10no-recommends
     echo 'APT::Install-Suggests "0";' > etc/apt/apt.conf.d/10no-suggests
@@ -84,8 +84,8 @@ EOF
     PATH="node-v16.13.0-linux-x64/bin:$PATH" chroot . npm install --global npm@latest n@latest
     PATH="node-v16.13.0-linux-x64/bin:$PATH" chroot . n $node_version
     rm -rf node-v16.13.0-linux-x64/bin
-}
-# install_chroot
+)}
+install_chroot
 
 genpas(){
     length=${1:-8}
@@ -106,6 +106,7 @@ CREATE USER '$chroot_user'@'localhost' IDENTIFIED BY '$db_password';
 GRANT ALL PRIVILEGES ON $chroot_user.* TO '$chroot_user'@'localhost' WITH GRANT OPTION;
 EOF
 chroot "$chroot_dir" mysql "$chroot_user" < dbinit.sql
+chroot "$chroot_dir" service mariadb stop || true
 
 # Configure the main server.
 cat > "$api_server/.env" <<EOF
@@ -125,11 +126,21 @@ DB_REMOTE_USER='$chroot_user'
 AUTH_DB_PASSWORD='$db_password'
 DB_REMOTE_PASSWORD='$db_password'
 DB_REMOTE_CONNECTION_LIMIT=100
+AUTH_TABLE_USERS=users
+AUTH_TABLE_SESSIONS=sessions
+AUTH_USER_FIELDS_LOGIN=email
+AUTH_USER_FIELDS_ID=id
+AUTH_USER_FIELDS_PASSWORD=password
+AUTH_SESSION_FIELDS_SESSION=session_id
+AUTH_SESSION_FIELDS_USER=user_id
+MEDIA_URL=http://localhost:$server_port/media
+MEDIA_PATH='/home/$chroot_user/$api_server/public/media'
 EOF
 
 # Copy our system into the chroot.
 mkdir "$api_server/public" 2> /dev/null || true
-cp -a "$client_front" "$organization_front" "$api_server/public/."
+cp -a "$client_front" "$api_server/public/client"
+cp -a "$organization_front" "$api_server/public/organization"
 cp -a "$api_server" "$chroot_dir/$chroot_home/."
 
 # Create a service to start the server.
@@ -150,6 +161,7 @@ EOF
 cat >> "$service_file" <<EOF
 courses_home='/$chroot_home/$api_server'
 courses_user='$chroot_user'
+log='$courses_home/server.log'
 EOF
 # Continue with the service script - no more variable expansion.
 cat >> "$service_file" <<'EOF'
@@ -221,7 +233,7 @@ if [ "$load" ]; then
     fi
 fi
 
-ssd="start-stop-daemon --quiet --pidfile=/tmp/ses-courses.pid --chdir $courses_home --chuid $courses_user"
+ssd="start-stop-daemon --quiet --pidfile=/tmp/ses-courses.pid --chdir '$courses_home' --chuid '$courses_user'"
 
 if [ "$stop" ]; then
         $ssd --stop && log_progress_msg 'server stopped.' || log_end_msg $?
@@ -229,7 +241,7 @@ if [ "$stop" ]; then
 fi
 
 if [ "$start" ]; then
-        $ssd --start --background --make-pidfile --exec /usr/local/bin/node -- index.js \
+        $ssd --start --background --make-pidfile --exec /usr/local/bin/node -- index.js >> "$log" 2>&1 \
             && log_progress_msg 'server started.' || log_end_msg $?
 fi
 
