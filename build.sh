@@ -3,7 +3,9 @@
 chroot_dir=./chroot
 chroot_user=ses
 chroot_home="home/$chroot_user"
-node_version='10.16.3'
+node_version=10.16.3
+mysql_package=https://downloads.mysql.com/archives/get/p/23/file/mysql-server_8.0.23-1debian10_amd64.deb-bundle.tar
+mysql_package_md5sum=32bc0153e844ffec559b862a9191eefa
 server_port=5500
 
 git_root=git@github.com:ses-education
@@ -15,17 +17,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # Verify/install required node version
 verify_node_version(){
-[ "$(node --version)" == v$node_version ] && return 0
-read -n 1 -p"Install node $node_version? " q; echo
-if [ "$(tr '[:upper:]' '[:lower:]' <<<"$q")" = 'y' ]; then
-    npm install -global n
-    n $node_version && return 0
-fi
-echo 'Can not build without correct node version, aborting'
-return 1
+    [ "$(node --version)" == v$node_version ] && return 0
+    read -n 1 -p"Install node $node_version? " q; echo
+    if [ "$(tr '[:upper:]' '[:lower:]' <<<"$q")" = 'y' ]; then
+        npm install -global n
+        n $node_version && return 0
+    fi
+    echo 'Can not build without correct node version, aborting'
+    return 1
 }
 
-# Clone and install the main server.
 clone_and_install(){(
     git clone --depth 1 --branch dev "$git_root/$1"
     cd "$1"
@@ -33,9 +34,9 @@ clone_and_install(){(
     npm install
     rm -rf .git
 )}
+# Clone and install the main server in the background if needed.
 [ -d "$api_server" ] || clone_and_install "$api_server" &
 
-# Clone, install and build the frontends.
 clone_install_and_build(){(
     clone_and_install "$1"
     cd "$1"
@@ -45,23 +46,17 @@ clone_install_and_build(){(
     rm -rf "$1"
     mv "$1.build" "$1"
 )}
+# Clone, install and build the frontends in the background if needed.
 [ -d "$client_front" ] || clone_install_and_build "$client_front" &
 [ -d "$organization_front" ] || clone_install_and_build "$organization_front" &
 
-# Create and install a chroot environment in the background.
 create_chroot(){(
     mkdir "$chroot_dir"
     cd "$chroot_dir"
     debootstrap --arch=amd64 --variant=minbase stable .
     chroot . useradd "$chroot_user" -m
-)}
-[ -d "$chroot_dir" ] || create_chroot &
 
-wait
-
-# Install software on the chroot.
-install_chroot(){(
-    cd "$chroot_dir"
+    # Configure apt.
     echo 'APT::Install-Recommends "0";' > etc/apt/apt.conf.d/10no-recommends
     echo 'APT::Install-Suggests "0";' > etc/apt/apt.conf.d/10no-suggests
     cat > etc/apt/sources.list <<EOF
@@ -70,23 +65,41 @@ deb http://deb.devuan.org/merged stable-security main
 deb http://deb.devuan.org/merged stable-updates main
 EOF
     chroot . apt update
-    # Installs should not try to run any services.
+
+    # Prepare mysql packages.
+    [ -f ../mysql.tar ] || curl -sL "$mysql_package" > ../mysql.tar
+    if ! md5sum ../mysql.tar | grep "$mysql_package_md5sum"; then
+        echo 'Can not get correct mysql version, aborting'
+        return 1
+    fi
+    tar xf ../mysql.tar
+    rm mysql-*test*.deb
+    rm mysql-*debug*.deb
+
+    # Install packages without running any services.
     echo exit 101 > usr/sbin/policy-rc.d
     DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f linux-image-amd64 grub-pc locales \
-        ca-certificates curl dhcpcd5 iproute2 iw netbase openssh-server wpasupplicant mariadb-server
-    rm usr/sbin/policy-rc.d
+        ca-certificates curl dhcpcd5 iproute2 iw netbase openssh-server wpasupplicant
+    DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f ./*.deb
+    rm *.deb usr/sbin/policy-rc.d
     chroot . apt clean
+
+    # Generate locale.
     echo en_US.UTF-8 UTF-8 > etc/locale.gen
     chroot . locale-gen
 
-    # Install the latest node version to install the right node version.
-    curl https://nodejs.org/dist/v16.13.0/node-v16.13.0-linux-x64.tar.xz | tar -Jx
+    # Install current LTS node version to install the right node version.
+    curl -s https://nodejs.org/dist/v16.13.0/node-v16.13.0-linux-x64.tar.xz | tar -Jx
     PATH="node-v16.13.0-linux-x64/bin:$PATH" chroot . npm install --global npm@latest n@latest
     PATH="node-v16.13.0-linux-x64/bin:$PATH" chroot . n $node_version
     rm -rf node-v16.13.0-linux-x64/bin
 )}
-install_chroot
+# Create and install a chroot environment in the background if needed.
+[ -d "$chroot_dir" ] || create_chroot &
 
+wait
+
+# Generate a password with exactly one punctuation sign and at least one capital and one number (for length >= 3).
 genpas(){
     length=${1:-8}
     {
@@ -99,18 +112,18 @@ genpas(){
 
 # Initialize the database.
 db_password="$(genpas)"
-chroot "$chroot_dir" service mariadb start || true # Allow for an sql server running on the host.
+chroot "$chroot_dir" service mysql start
 chroot "$chroot_dir" mysql <<EOF
 CREATE DATABASE $chroot_user;
 CREATE USER '$chroot_user'@'localhost' IDENTIFIED BY '$db_password';
 GRANT ALL PRIVILEGES ON $chroot_user.* TO '$chroot_user'@'localhost' WITH GRANT OPTION;
 EOF
 chroot "$chroot_dir" mysql "$chroot_user" < dbinit.sql
-chroot "$chroot_dir" service mariadb stop || true
+chroot "$chroot_dir" service mysql stop
 
 # Configure the main server.
 cat > "$api_server/.env" <<EOF
-AUTH_JWT_KEY='$(genpas 32)'
+AUTH_JWT_KEY=SESCoursesVerySecretString2020
 PORT=$server_port
 STUDENT_SITE_URL=http://localhost:$server_port/client
 ORGANIZATION_SITE_URL=http://localhost:$server_port/organization
@@ -137,8 +150,8 @@ MEDIA_URL=http://localhost:$server_port/media
 MEDIA_PATH='/home/$chroot_user/$api_server/public/media'
 EOF
 
-# Copy our system into the chroot.
-mkdir "$api_server/public" 2> /dev/null || true
+# Copy frontends and media to the server, and the server to the chroot.
+mkdir "$api_server/public" 2> /dev/null || true  # FIXME for working on existing chroot only.
 cp -a "$client_front" "$api_server/public/client"
 cp -a "$organization_front" "$api_server/public/organization"
 cp -a "$api_server" "$chroot_dir/$chroot_home/."
@@ -161,7 +174,6 @@ EOF
 cat >> "$service_file" <<EOF
 courses_home='/$chroot_home/$api_server'
 courses_user='$chroot_user'
-log='$courses_home/server.log'
 EOF
 # Continue with the service script - no more variable expansion.
 cat >> "$service_file" <<'EOF'
@@ -195,13 +207,10 @@ esac
 connection_file=connection.conf
 connect(){
     log_progress_msg 'connecting to internet.'
-    # FIXME
-    return 0
-    read ssid password < "$courses_home/$connection_file" 2> /dev/null
-    ip link set eth0 down
-    ip link set wlan0 down
     pkill wpa_supplicant || true
     iw dev wlan0 disconnect || true
+    ip link set eth0 down
+    ip link set wlan0 down
     if [ "$ssid" ]; then
         ip link set wlan0 up
         if [ "$password" ]; then
@@ -234,6 +243,7 @@ if [ "$load" ]; then
 fi
 
 ssd="start-stop-daemon --quiet --pidfile=/tmp/ses-courses.pid --chdir '$courses_home' --chuid '$courses_user'"
+log="$courses_home/server.log"
 
 if [ "$stop" ]; then
         $ssd --stop && log_progress_msg 'server stopped.' || log_end_msg $?
