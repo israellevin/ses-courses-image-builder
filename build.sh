@@ -3,52 +3,14 @@
 chroot_dir=./chroot
 chroot_user=ses
 chroot_home="home/$chroot_user"
-node_version=10.16.3
 mysql_package=https://downloads.mysql.com/archives/get/p/23/file/mysql-server_8.0.23-1debian10_amd64.deb-bundle.tar
 mysql_package_md5sum=32bc0153e844ffec559b862a9191eefa
+db_init=dbinit.sql
+api_server=ses-courses-api
+node_version=10.16.3
 server_port=5500
 
-git_root=git@github.com:ses-education
-api_server=ses-courses-api
-client_front=ses-courses-client
-organization_front=ses-courses-organization
-
 cd "$(dirname "${BASH_SOURCE[0]}")"
-
-# Verify/install required node version
-verify_node_version(){
-    [ "$(node --version)" == v$node_version ] && return 0
-    read -n 1 -p"Install node $node_version? " q; echo
-    if [ "$(tr '[:upper:]' '[:lower:]' <<<"$q")" = 'y' ]; then
-        npm install -global n
-        n $node_version && return 0
-    fi
-    echo 'Can not build without correct node version, aborting'
-    return 1
-}
-
-clone_and_install(){(
-    git clone --depth 1 --branch dev "$git_root/$1"
-    cd "$1"
-    verify_node_version
-    npm install
-    rm -rf .git
-)}
-# Clone and install the main server in the background if needed.
-[ -d "$api_server" ] || clone_and_install "$api_server" &
-
-clone_install_and_build(){(
-    clone_and_install "$1"
-    cd "$1"
-    REACT_APP_BASE_URL="$1" npm run build
-    mv build "../$1.build"
-    cd ..
-    rm -rf "$1"
-    mv "$1.build" "$1"
-)}
-# Clone, install and build the frontends in the background if needed.
-[ -d "$client_front" ] || clone_install_and_build "$client_front" &
-[ -d "$organization_front" ] || clone_install_and_build "$organization_front" &
 
 create_chroot(){(
     mkdir "$chroot_dir"
@@ -78,8 +40,8 @@ EOF
 
     # Install packages without running any services.
     echo exit 101 > usr/sbin/policy-rc.d
-    DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f linux-image-amd64 grub-pc locales \
-        ca-certificates curl dhcpcd5 iproute2 iw netbase openssh-server wpasupplicant
+    DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f linux-image-amd64 grub-pc cron locales \
+        ca-certificates curl dhcpcd5 iproute2 netbase openssh-server
     DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f ./*.deb
     rm *.deb usr/sbin/policy-rc.d
     chroot . apt clean
@@ -94,66 +56,15 @@ EOF
     PATH="node-v16.13.0-linux-x64/bin:$PATH" chroot . n $node_version
     rm -rf node-v16.13.0-linux-x64/bin
 )}
-# Create and install a chroot environment in the background if needed.
-[ -d "$chroot_dir" ] || create_chroot &
+# Create and install a chroot environment if needed.
+[ -d "$chroot_dir" ] || create_chroot
 
-wait
-
-# Generate a password with exactly one punctuation sign and at least one capital and one number (for length >= 3).
-genpas(){
-    length=${1:-8}
-    {
-        shuf -ern1 ':' ';' '<' '=' '>' '?' '@' '[' ']' '^' '_' '`' '{' '|' '}' '~'
-        shuf -ern1 {0..9}
-        shuf -ern1 {A..Z}
-        shuf -ern$((length - 3)) {0..9} {A..Z} {a..z} {a..z} {a..z}
-    } | shuf | tr -d "\n"
-}
-
-# Initialize the database.
-db_password="$(genpas)"
+## Initialize the database.
 chroot "$chroot_dir" service mysql start
-chroot "$chroot_dir" mysql <<EOF
-CREATE DATABASE $chroot_user;
-CREATE USER '$chroot_user'@'localhost' IDENTIFIED BY '$db_password';
-GRANT ALL PRIVILEGES ON $chroot_user.* TO '$chroot_user'@'localhost' WITH GRANT OPTION;
-EOF
-chroot "$chroot_dir" mysql "$chroot_user" < dbinit.sql
+chroot "$chroot_dir" mysql < "$dbinit"
 chroot "$chroot_dir" service mysql stop
 
-# Configure the main server.
-cat > "$api_server/.env" <<EOF
-AUTH_JWT_KEY=SESCoursesVerySecretString2020
-PORT=$server_port
-STUDENT_SITE_URL=http://localhost:$server_port/client
-ORGANIZATION_SITE_URL=http://localhost:$server_port/organization
-STATIC_FILES_FOLDER=/public
-AUTH_DB_HOST=localhost
-DB_REMOTE_HOST=localhost
-AUTH_DB_PORT=3306
-DB_REMOTE_PORT=3306
-AUTH_DB_DB='$chroot_user'
-DB_REMOTE_DATABASE='$chroot_user'
-AUTH_DB_USER='$chroot_user'
-DB_REMOTE_USER='$chroot_user'
-AUTH_DB_PASSWORD='$db_password'
-DB_REMOTE_PASSWORD='$db_password'
-DB_REMOTE_CONNECTION_LIMIT=100
-AUTH_TABLE_USERS=users
-AUTH_TABLE_SESSIONS=sessions
-AUTH_USER_FIELDS_LOGIN=email
-AUTH_USER_FIELDS_ID=id
-AUTH_USER_FIELDS_PASSWORD=password
-AUTH_SESSION_FIELDS_SESSION=session_id
-AUTH_SESSION_FIELDS_USER=user_id
-MEDIA_URL=http://localhost:$server_port/media
-MEDIA_PATH='/home/$chroot_user/$api_server/public/media'
-EOF
-
-# Copy frontends and media to the server, and the server to the chroot.
-mkdir "$api_server/public" 2> /dev/null || true  # FIXME for working on existing chroot only.
-cp -a "$client_front" "$api_server/public/client"
-cp -a "$organization_front" "$api_server/public/organization"
+## Copy frontends and media to the server, and the server to the chroot.
 cp -a "$api_server" "$chroot_dir/$chroot_home/."
 
 # Create a service to start the server.
@@ -204,41 +115,38 @@ case "$1" in
         log_end_msg 1
 esac
 
-connection_file=connection.conf
+get_ip(){
+    ip addr show dev eth0 | grep -Po '(?<=inet )[^/ ]*'
+}
+
 connect(){
-    log_progress_msg 'connecting to internet.'
-    pkill wpa_supplicant || true
-    iw dev wlan0 disconnect || true
+    get_ip && return 0
+    log_progress_msg 'connecting to network.'
+    pkill dhclient
     ip link set eth0 down
-    ip link set wlan0 down
-    if [ "$ssid" ]; then
-        ip link set wlan0 up
-        if [ "$password" ]; then
-            bash -c 'wpa_supplicant -i wlan0 -c <(wpa_passphrase "'$ssid'" "'$password'")'
-        else
-            iw dev wlan0 connect "$ssid"
-            dhclient wlan0
-        fi
-    else
-        ip link set eth0 up
-        dhclient eth0
-    fi
+    ip link set eth0 up
+    dhclient eth0
 }
 
 if [ "$load" ]; then
-    # Try to mount USB drive and update settings before connecting.
+    connect
+    # Try to mount USB drive and write ip.
     mount_point=/mnt
     if mount /dev/sdb1 "$mount_point" 2> /dev/null; then
-        log_progress_msg 'mounting external drive.'
-        if [ -r "$mount_point/$connection_file" ]; then
-            cat "$mount_point/$connection_file" > "$courses_home/$connection_file"
-            log_progress_msg 'loaded connection file.'
-        fi
-        connect
-        ip a > "$mount_point/courses.ip.txt"
+        log_progress_msg 'writing index.html to external drive.'
+        cat > "$mount_point/index.html" <<EOHTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SES Index</title>
+</head>
+<body>
+    <a href="http://$(get_ip)">
+</body>
+</html>
+EOHTML
         umount "$mount_point"
-    else
-        connect
     fi
 fi
 
@@ -258,14 +166,16 @@ fi
 $ssd --status && log_progress_msg 'all running' || log_progress_msg 'all stopped'
 log_end_msg $?
 EOF
-chmod +x "$service_file"
 
-# Initialize database.
-chroot "$chroot_dir" chown -R "$chroot_user:$chroot_user" "/$chroot_home"
+# Set up the service (with a cron job).
+chmod +x "$service_file"
+chroot "$chroot_dir" update-rc.d ses-courses defaults
+echo '* * * * * sh -c "service ses-courses status || service ses-courses start"' | chroot "$chroot_dir" crontab -
 
 # Fix permissions, set the password and show it.
 chroot "$chroot_dir" chown -R "$chroot_user:$chroot_user" "/$chroot_home"
-password="$(genpas)"
+password="$(shuf -zern8 {A..Z} {a..z} {0..9} | tr -d '\0')"
+echo "root:$password" | chroot "$chroot_dir" chpasswd
 echo "$chroot_user:$password" | chroot "$chroot_dir" chpasswd
 echo "Your password is $password"
 exit
