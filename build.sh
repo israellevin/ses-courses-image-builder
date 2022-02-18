@@ -3,14 +3,12 @@
 chroot_dir=./chroot
 chroot_user=ses
 chroot_home="home/$chroot_user"
-mysql_package=https://downloads.mysql.com/archives/get/p/23/file/mysql-server_8.0.23-1debian10_amd64.deb-bundle.tar
-mysql_package_md5sum=32bc0153e844ffec559b862a9191eefa
 db_init=dbinit.sql
 api_server=ses-courses-api
 node_version=10.16.3
 server_port=5500
 
-cd "$(dirname "${BASH_SOURCE[0]}")"
+pushd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null
 
 create_chroot(){(
     mkdir "$chroot_dir"
@@ -19,36 +17,44 @@ create_chroot(){(
     chroot . useradd "$chroot_user" -m
 
     # Configure apt.
-    echo 'APT::Install-Recommends "0";' > etc/apt/apt.conf.d/10no-recommends
-    echo 'APT::Install-Suggests "0";' > etc/apt/apt.conf.d/10no-suggests
-    cat > etc/apt/sources.list <<EOF
+    echo 'APT::Install-Recommends "0";' > ./etc/apt/apt.conf.d/10no-recommends
+    echo 'APT::Install-Suggests "0";' > ./etc/apt/apt.conf.d/10no-suggests
+    cat > ./etc/apt/sources.list <<EOF
 deb http://deb.devuan.org/merged stable main
 deb http://deb.devuan.org/merged stable-security main
 deb http://deb.devuan.org/merged stable-updates main
 EOF
     chroot . apt update
 
-    # Prepare mysql packages.
-    [ -f ../mysql.tar ] || curl -sL "$mysql_package" > ../mysql.tar
-    if ! md5sum ../mysql.tar | grep "$mysql_package_md5sum"; then
-        echo 'Can not get correct mysql version, aborting'
-        return 1
-    fi
-    tar xf ../mysql.tar
-    rm mysql-*test*.deb
-    rm mysql-*debug*.deb
-
     # Install packages without running any services.
-    echo exit 101 > usr/sbin/policy-rc.d
-    DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f linux-image-amd64 grub-pc cron locales \
-        ca-certificates curl dhcpcd5 iproute2 netbase openssh-server
-    DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f ./*.deb
-    rm *.deb usr/sbin/policy-rc.d
+    echo exit 101 > ./usr/sbin/policy-rc.d
+    DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f linux-image-amd64 grub-pc locales \
+        ca-certificates curl dhcpcd5 ifupdown iproute2 monit netbase openssh-server
+
+    # Add unstable repo for latest mysql.
+    cat > ./etc/apt/sources.list <<EOF
+deb http://deb.devuan.org/merged unstable main
+EOF
+    chroot . apt update
+    # This fails on chroot, but still works.
+    DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f mysql-server || true
+    chroot . usermod -d /var/lib/mysql/ mysql
+
+    # Restore and clean apt.
+    rm ./usr/sbin/policy-rc.d
     chroot . apt clean
 
     # Generate locale.
     echo en_US.UTF-8 UTF-8 > etc/locale.gen
     chroot . locale-gen
+
+    # Configure network.
+    cat >> ./etc/network/interfaces <<EOF
+# Wired interface
+auto eth0
+allow-hotplug eth0
+iface eth0 inet dhcp
+EOF
 
     # Install current LTS node version to install the right node version.
     curl -s https://nodejs.org/dist/v16.13.0/node-v16.13.0-linux-x64.tar.xz | tar -Jx
@@ -59,16 +65,18 @@ EOF
 # Create and install a chroot environment if needed.
 [ -d "$chroot_dir" ] || create_chroot
 
-## Initialize the database.
+# Initialize the database.
 chroot "$chroot_dir" service mysql start
-chroot "$chroot_dir" mysql < "$dbinit"
+chroot "$chroot_dir" mysql < "$db_init"
 chroot "$chroot_dir" service mysql stop
 
-## Copy frontends and media to the server, and the server to the chroot.
+# Copy frontends and media to the server, and the server to the chroot.
 cp -a "$api_server" "$chroot_dir/$chroot_home/."
 
+pushd "$chroot_dir" > /dev/null
+
 # Create a service to start the server.
-service_file="$chroot_dir/etc/init.d/ses-courses"
+service_file="./etc/init.d/ses-courses"
 cat > "$service_file" <<'EOF'
 ### BEGIN INIT INFO
 # Provides: ses-courses
@@ -85,6 +93,7 @@ EOF
 cat >> "$service_file" <<EOF
 courses_home='/$chroot_home/$api_server'
 courses_user='$chroot_user'
+server_port='$server_port'
 EOF
 # Continue with the service script - no more variable expansion.
 cat >> "$service_file" <<'EOF'
@@ -104,6 +113,7 @@ case "$1" in
         ;;
     status)
         log_daemon_msg "SES courses service fetching status"
+        status=1
         ;;
     restart)
         stop=1
@@ -119,17 +129,7 @@ get_ip(){
     ip addr show dev eth0 | grep -Po '(?<=inet )[^/ ]*'
 }
 
-connect(){
-    get_ip && return 0
-    log_progress_msg 'connecting to network.'
-    pkill dhclient
-    ip link set eth0 down
-    ip link set eth0 up
-    dhclient eth0
-}
-
 if [ "$load" ]; then
-    connect
     # Try to mount USB drive and write ip.
     mount_point=/mnt
     if mount /dev/sdb1 "$mount_point" 2> /dev/null; then
@@ -142,7 +142,7 @@ if [ "$load" ]; then
     <title>SES Index</title>
 </head>
 <body>
-    <a href="http://$(get_ip)">
+    <a href="http://$(get_ip):$server_port">courses app</a>
 </body>
 </html>
 EOHTML
@@ -150,32 +150,58 @@ EOHTML
     fi
 fi
 
-ssd="start-stop-daemon --quiet --pidfile=/tmp/ses-courses.pid --chdir '$courses_home' --chuid '$courses_user'"
+ssd="start-stop-daemon --quiet --pidfile=/tmp/ses-courses.pid --chdir $courses_home --chuid $courses_user"
 log="$courses_home/server.log"
 
+exit_code=0
+
 if [ "$stop" ]; then
-        $ssd --stop && log_progress_msg 'server stopped.' || log_end_msg $?
+        $ssd --stop && log_progress_msg 'server stopped.' || exit_code=1
         sleep 1
 fi
 
 if [ "$start" ]; then
+    if ss -lnt | grep ":$server_port " > /dev/null 2>&1; then
+        log_progress_msg 'server already running.'
+        exit_code=1
+    else
         $ssd --start --background --make-pidfile --exec /usr/local/bin/node -- index.js >> "$log" 2>&1 \
-            && log_progress_msg 'server started.' || log_end_msg $?
+            && log_progress_msg 'server started.' || exit_code=1
+    fi
 fi
 
-$ssd --status && log_progress_msg 'all running' || log_progress_msg 'all stopped'
-log_end_msg $?
+if [ "$status" ]; then
+    if $ssd --status; then
+        log_progress_msg 'all running.'
+    else
+        log_progress_msg 'all stopped.'
+        exit_code=1
+    fi
+fi
+log_end_msg > /dev/null "$exit_code"
+EOF
+chmod +x "$service_file"
+
+# Install the service.
+chroot . update-rc.d ses-courses defaults
+
+# Configure monit to monitor our service with a simple starter script.
+cat > ./root/run-ses-courses <<EOF
+service ses-courses start
+EOF
+chmod +x ./root/run-ses-courses
+cat > ./etc/monit/conf.d/ses-courses <<'EOF'
+check process ses-courses with pidfile /tmp/ses-courses.pid
+    start program = "/root/run-ses-courses"
 EOF
 
-# Set up the service (with a cron job).
-chmod +x "$service_file"
-chroot "$chroot_dir" update-rc.d ses-courses defaults
-echo '* * * * * sh -c "service ses-courses status || service ses-courses start"' | chroot "$chroot_dir" crontab -
-
 # Fix permissions, set the password and show it.
-chroot "$chroot_dir" chown -R "$chroot_user:$chroot_user" "/$chroot_home"
+chroot . chown -R "$chroot_user:$chroot_user" "/$chroot_home"
 password="$(shuf -zern8 {A..Z} {a..z} {0..9} | tr -d '\0')"
-echo "root:$password" | chroot "$chroot_dir" chpasswd
-echo "$chroot_user:$password" | chroot "$chroot_dir" chpasswd
+echo "root:$password" | chroot . chpasswd
+echo "$chroot_user:$password" | chroot . chpasswd
 echo "Your password is $password"
-exit
+
+popd > /dev/null
+popd > /dev/null
+exit 0
