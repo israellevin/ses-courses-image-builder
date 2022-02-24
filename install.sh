@@ -1,82 +1,68 @@
-#!/usr/bin/bash -eu
-# Builds an SES courses image.
-chroot_dir=./chroot
-chroot_user=ses
-chroot_home="home/$chroot_user"
-db_init=dbinit.sql
-api_server=ses-courses-api
+#!/bin/bash -eu
+# Installs SES-courses server on a devuan machine.
+server_user=ses
+db_init_file=dbinit.sql
+server_directory=ses-courses-api
 node_version=10.16.3
+node_lts_version=16.13.0
 server_port=5500
 
-pushd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null
+# Run as root.
+if [ "$EUID" -ne 0 ]; then
+    sudo "$0" "$@"
+    exit
+fi
 
-create_chroot(){(
-    mkdir "$chroot_dir"
-    cd "$chroot_dir"
-    debootstrap --arch=amd64 --variant=minbase stable .
-    chroot . useradd "$chroot_user" -m
+# Configure network.
+cat >> /etc/network/interfaces <<EOF
+# Loopback interface
+auto lo
+iface lo inet loopback
 
-    # Configure apt.
-    echo 'APT::Install-Recommends "0";' > ./etc/apt/apt.conf.d/10no-recommends
-    echo 'APT::Install-Suggests "0";' > ./etc/apt/apt.conf.d/10no-suggests
-    cat > ./etc/apt/sources.list <<EOF
-deb http://deb.devuan.org/merged stable main
-deb http://deb.devuan.org/merged stable-security main
-deb http://deb.devuan.org/merged stable-updates main
-EOF
-    chroot . apt update
-
-    # Install packages without running any services.
-    echo exit 101 > ./usr/sbin/policy-rc.d
-    DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f linux-image-amd64 grub-pc locales \
-        ca-certificates curl dhcpcd5 ifupdown iproute2 monit netbase openssh-server
-
-    # Add unstable repo for latest mysql.
-    cat > ./etc/apt/sources.list <<EOF
-deb http://deb.devuan.org/merged unstable main
-EOF
-    chroot . apt update
-    # This fails on chroot, but still works.
-    DEBIAN_FRONTEND=noninteractive chroot . apt -y install -f mysql-server || true
-    chroot . usermod -d /var/lib/mysql/ mysql
-
-    # Restore and clean apt.
-    rm ./usr/sbin/policy-rc.d
-    chroot . apt clean
-
-    # Generate locale.
-    echo en_US.UTF-8 UTF-8 > etc/locale.gen
-    chroot . locale-gen
-
-    # Configure network.
-    cat >> ./etc/network/interfaces <<EOF
 # Wired interface
 auto eth0
 allow-hotplug eth0
 iface eth0 inet dhcp
 EOF
 
-    # Install current LTS node version to install the right node version.
-    curl -s https://nodejs.org/dist/v16.13.0/node-v16.13.0-linux-x64.tar.xz | tar -Jx
-    PATH="node-v16.13.0-linux-x64/bin:$PATH" chroot . npm install --global npm@latest n@latest
-    PATH="node-v16.13.0-linux-x64/bin:$PATH" chroot . n $node_version
-    rm -rf node-v16.13.0-linux-x64/bin
-)}
-# Create and install a chroot environment if needed.
-[ -d "$chroot_dir" ] || create_chroot
+# Configure apt.
+cat > /etc/apt/sources.list <<EOF
+deb http://deb.devuan.org/merged stable main
+deb http://deb.devuan.org/merged stable-security main
+deb http://deb.devuan.org/merged stable-updates main
+EOF
+
+# Install required packages.
+apt update
+DEBIAN_FRONTEND=noninteractive apt -y install -f \
+        ca-certificates curl dhcpcd5 ifupdown iproute2 monit netbase openssh-server
+
+# Add unstable repo for latest mysql and install it.
+cat > /etc/apt/sources.list <<EOF
+deb http://deb.devuan.org/merged unstable main
+EOF
+apt update
+DEBIAN_FRONTEND=noninteractive apt -y install -f mysql-server
+
+# Move to script directory.
+pushd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null
+
+# Use node LTS version to install the right node version.
+[ -d node-v$node_lts_version-linux-x64/bin ] || \
+    curl -s https://nodejs.org/dist/v$node_lts_version/node-v$node_lts_version-linux-x64.tar.xz | tar -Jx
+PATH="./node-v16.13.0-linux-x64/bin:$PATH" npm install --global npm@latest n@latest
+PATH="./node-v16.13.0-linux-x64/bin:$PATH" n $node_version
 
 # Initialize the database.
-chroot "$chroot_dir" service mysql start
-chroot "$chroot_dir" mysql < "$db_init"
-chroot "$chroot_dir" service mysql stop
+service mysql status || service mysql start
+mysql < "$db_init_file"
 
-# Copy frontends and media to the server, and the server to the chroot.
-cp -a "$api_server" "$chroot_dir/$chroot_home/."
-
-pushd "$chroot_dir" > /dev/null
+# Copy server directory to the user's home with right permissions.
+cp -a "$server_directory" "/home/$server_user/."
+chown -R "$server_user:$server_user" "/home/$server_user/$server_directory"
 
 # Create a service to start the server.
-service_file="./etc/init.d/ses-courses"
+service_file="/etc/init.d/ses-courses"
 cat > "$service_file" <<'EOF'
 ### BEGIN INIT INFO
 # Provides: ses-courses
@@ -91,8 +77,8 @@ set -e
 EOF
 # Inject some variables to the service script - this part goes through variable expansion.
 cat >> "$service_file" <<EOF
-courses_home='/$chroot_home/$api_server'
-courses_user='$chroot_user'
+courses_home='/home/$server_user/$server_directory'
+courses_user='$server_user'
 server_port='$server_port'
 EOF
 # Continue with the service script - no more variable expansion.
@@ -181,27 +167,17 @@ fi
 log_end_msg > /dev/null "$exit_code"
 EOF
 chmod +x "$service_file"
-
-# Install the service.
-chroot . update-rc.d ses-courses defaults
+update-rc.d ses-courses defaults
 
 # Configure monit to monitor our service with a simple starter script.
-cat > ./root/run-ses-courses <<EOF
+cat > /sbin/run-ses-courses <<EOF
 service ses-courses start
 EOF
-chmod +x ./root/run-ses-courses
-cat > ./etc/monit/conf.d/ses-courses <<'EOF'
+chmod +x /sbin/run-ses-courses
+cat > /etc/monit/conf.d/ses-courses <<'EOF'
 check process ses-courses with pidfile /tmp/ses-courses.pid
-    start program = "/root/run-ses-courses"
+    start program = "/sbin/run-ses-courses"
 EOF
 
-# Fix permissions, set the password and show it.
-chroot . chown -R "$chroot_user:$chroot_user" "/$chroot_home"
-password="$(shuf -zern8 {A..Z} {a..z} {0..9} | tr -d '\0')"
-echo "root:$password" | chroot . chpasswd
-echo "$chroot_user:$password" | chroot . chpasswd
-echo "Your password is $password"
-
-popd > /dev/null
 popd > /dev/null
 exit 0
