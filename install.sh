@@ -3,8 +3,8 @@
 server_user=ses
 db_init_file=dbinit.sql
 server_directory=ses-courses-api
-node_version=10.16.3
-node_lts_version=16.13.0
+node_version=20.9.0
+node_lts_version=20.9.0
 server_port=5500
 
 # Run as root.
@@ -13,53 +13,34 @@ if [ "$EUID" -ne 0 ]; then
     exit
 fi
 
-# Configure network.
-cat >> /etc/network/interfaces <<EOF
-# Loopback interface
-auto lo
-iface lo inet loopback
-
-# Wired interface
-auto eth0
-allow-hotplug eth0
-iface eth0 inet dhcp
-EOF
-
-# Configure apt.
-cat > /etc/apt/sources.list <<EOF
-deb http://deb.devuan.org/merged stable main
-deb http://deb.devuan.org/merged stable-security main
-deb http://deb.devuan.org/merged stable-updates main
-EOF
+# Create the server user.
+if [ -d "/home/$server_user" ]; then
+    echo "User $server_user already exists - exiting"
+    exit 1
+fi
+useradd --create-home --user-group --shell "$(type -p bash)" "$server_user"
 
 # Install required packages.
 apt update
 DEBIAN_FRONTEND=noninteractive apt -y install -f \
-        ca-certificates curl dhcpcd5 ifupdown iproute2 monit netbase openssh-server
-
-# Add unstable repo for latest mysql and install it.
-cat > /etc/apt/sources.list <<EOF
-deb http://deb.devuan.org/merged unstable main
-EOF
-apt update
-DEBIAN_FRONTEND=noninteractive apt -y install -f mysql-server
-
-# Move to script directory.
-pushd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null
+        ca-certificates curl dhcpcd5 ifupdown iproute2 monit netbase openssh-server mysql-server
 
 # Use node LTS version to install the right node version.
 [ -d node-v$node_lts_version-linux-x64/bin ] || \
     curl -s https://nodejs.org/dist/v$node_lts_version/node-v$node_lts_version-linux-x64.tar.xz | tar -Jx
-PATH="./node-v16.13.0-linux-x64/bin:$PATH" npm install --global npm@latest n@latest
-PATH="./node-v16.13.0-linux-x64/bin:$PATH" n $node_version
+PATH="./node-v$node_lts_version-linux-x64/bin:$PATH" npm install --global npm@latest n@latest
+PATH="./node-v$node_lts_version-linux-x64/bin:$PATH" n $node_version
+
+# Move to script directory.
+pushd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null
 
 # Initialize the database.
 service mysql status || service mysql start
 mysql < "$db_init_file"
 
 # Copy server directory to the user's home with right permissions.
-cp -a "$server_directory" "/home/$server_user/."
-chown -R "$server_user:$server_user" "/home/$server_user/$server_directory"
+rsync -a --chown="$server_user:$server_user" --no-inc-recursive --info=progress2 \
+    "$server_directory"/ "/home/$server_user/$server_directory/"
 
 # Create a service to start the server.
 service_file="/etc/init.d/ses-courses"
