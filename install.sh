@@ -5,7 +5,6 @@ db_init_file=dbinit.sql
 server_directory=ses-courses-api
 node_version=20.9.0
 node_lts_version=20.9.0
-server_port=5500
 
 # Run as root.
 if [ "$EUID" -ne 0 ]; then
@@ -13,17 +12,18 @@ if [ "$EUID" -ne 0 ]; then
     exit
 fi
 
-# Create the server user.
-if [ -d "/home/$server_user" ]; then
-    echo "User $server_user already exists - exiting"
-    exit 1
+# Move to script directory.
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+# Create the server user if needed.
+if [ -z "$(getent passwd $server_user)" ]; then
+    useradd --create-home --user-group --shell "$(type -p bash)" $server_user
 fi
-useradd --create-home --user-group --shell "$(type -p bash)" "$server_user"
 
 # Install required packages.
 apt update
 DEBIAN_FRONTEND=noninteractive apt -y install -f \
-        ca-certificates curl dhcpcd5 ifupdown iproute2 monit netbase openssh-server mysql-server
+        ca-certificates curl dhcpcd5 ifupdown iproute2 netbase openssh-server mysql-server
 
 # Use node LTS version to install the right node version.
 [ -d node-v$node_lts_version-linux-x64/bin ] || \
@@ -31,134 +31,46 @@ DEBIAN_FRONTEND=noninteractive apt -y install -f \
 PATH="./node-v$node_lts_version-linux-x64/bin:$PATH" npm install --global npm@latest n@latest
 PATH="./node-v$node_lts_version-linux-x64/bin:$PATH" n $node_version
 
-# Move to script directory.
-pushd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null
-
 # Initialize the database.
 service mysql status || service mysql start
-mysql < "$db_init_file"
+mysql < $db_init_file
 
 # Copy server directory to the user's home with right permissions.
-rsync -a --chown="$server_user:$server_user" --no-inc-recursive --info=progress2 \
-    "$server_directory"/ "/home/$server_user/$server_directory/"
+rsync -a --chown=$server_user:$server_user --no-inc-recursive --info=progress2 \
+    $server_directory/ /home/$server_user/$server_directory/
+
+# Install node requirements as the server user.
+su - $server_user -c "cd /home/$server_user/$server_directory && npm install"
 
 # Create a service to start the server.
-service_file="/etc/init.d/ses-courses"
+service_file="/etc/systemd/system/ses-courses.service"
 cat > "$service_file" <<'EOF'
-### BEGIN INIT INFO
-# Provides: ses-courses
-# Required-Start: $remote_fs $syslog
-# Required-Stop: $remote_fs $syslog
-# Default-Start: 2 3 4 5
-# Default-Stop: 0 1 6
-# Short-Description: SES courses system
-### END INIT INFO
-set -e
-. /lib/lsb/init-functions
+[Unit]
+Description=SES Courses System
+After=mysql.service
+Requires=mysql.service
+
+[Service]
 EOF
-# Inject some variables to the service script - this part goes through variable expansion.
+# This part goes through variable expansion.
 cat >> "$service_file" <<EOF
-courses_home='/home/$server_user/$server_directory'
-courses_user='$server_user'
-server_port='$server_port'
+Type=simple
+User=$server_user
+WorkingDirectory=/home/$server_user/$server_directory
+PIDFile=/tmp/ses-courses.pid
+ExecStart=/usr/local/bin/node index.js >> /home/$server_user/$server_directory/server.log 2>&1
+ExecStop=/bin/sh -c 'start-stop-daemon --quiet --stop --pidfile=/tmp/ses-courses.pid --chuid $server_user'
+Restart=always
 EOF
-# Continue with the service script - no more variable expansion.
+# This part does not.
 cat >> "$service_file" <<'EOF'
-case "$1" in
-    reload)
-        log_daemon_msg "SES courses service loading"
-        load=1
-        ;;
-    start)
-        log_daemon_msg "SES courses service starting"
-        load=1
-        start=1
-        ;;
-    stop)
-        log_daemon_msg "SES courses service stopping"
-        stop=1
-        ;;
-    status)
-        log_daemon_msg "SES courses service fetching status"
-        status=1
-        ;;
-    restart)
-        stop=1
-        start=1
-        ;;
-    *)
-        echo "usage: $0 {start|stop|status|restart|reload}"
-        log_daemon_msg "SES courses service got unknown command $@"
-        log_end_msg 1
-esac
-
-get_ip(){
-    ip addr show dev eth0 | grep -Po '(?<=inet )[^/ ]*'
-}
-
-if [ "$load" ]; then
-    # Try to mount USB drive and write ip.
-    mount_point=/mnt
-    if mount /dev/sdb1 "$mount_point" 2> /dev/null; then
-        log_progress_msg 'writing index.html to external drive.'
-        cat > "$mount_point/index.html" <<EOHTML
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>SES Index</title>
-</head>
-<body>
-    <a href="http://$(get_ip):$server_port">courses app</a>
-</body>
-</html>
-EOHTML
-        umount "$mount_point"
-    fi
-fi
-
-ssd="start-stop-daemon --quiet --pidfile=/tmp/ses-courses.pid --chdir $courses_home --chuid $courses_user"
-log="$courses_home/server.log"
-
-exit_code=0
-
-if [ "$stop" ]; then
-        $ssd --stop && log_progress_msg 'server stopped.' || exit_code=1
-        sleep 1
-fi
-
-if [ "$start" ]; then
-    if ss -lnt | grep ":$server_port " > /dev/null 2>&1; then
-        log_progress_msg 'server already running.'
-        exit_code=1
-    else
-        $ssd --start --background --make-pidfile --exec /usr/local/bin/node -- index.js >> "$log" 2>&1 \
-            && log_progress_msg 'server started.' || exit_code=1
-    fi
-fi
-
-if [ "$status" ]; then
-    if $ssd --status; then
-        log_progress_msg 'all running.'
-    else
-        log_progress_msg 'all stopped.'
-        exit_code=1
-    fi
-fi
-log_end_msg > /dev/null "$exit_code"
-EOF
-chmod +x "$service_file"
-update-rc.d ses-courses defaults
-
-# Configure monit to monitor our service with a simple starter script.
-cat > /sbin/run-ses-courses <<EOF
-service ses-courses start
-EOF
-chmod +x /sbin/run-ses-courses
-cat > /etc/monit/conf.d/ses-courses <<'EOF'
-check process ses-courses with pidfile /tmp/ses-courses.pid
-    start program = "/sbin/run-ses-courses"
+[Install]
+WantedBy=multi-user.target
 EOF
 
-popd > /dev/null
+# Enable the service.
+systemctl daemon-reload
+systemctl enable ses-courses
+systemctl start ses-courses
+
 exit 0
