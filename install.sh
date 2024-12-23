@@ -4,7 +4,6 @@ server_user=ses
 db_init_file=dbinit.sql
 server_directory=ses-courses-api
 node_version=20.9.0
-node_lts_version=20.9.0
 
 # Run as root.
 if [ "$EUID" -ne 0 ]; then
@@ -23,13 +22,11 @@ fi
 # Install required packages.
 apt update
 DEBIAN_FRONTEND=noninteractive apt -y install -f \
-        ca-certificates curl dhcpcd5 ifupdown iproute2 netbase openssh-server mysql-server
+        ca-certificates curl dhcpcd5 ifupdown iproute2 netbase openssh-server mysql-server npm
 
-# Use node LTS version to install the right node version.
-[ -d node-v$node_lts_version-linux-x64/bin ] || \
-    curl -s https://nodejs.org/dist/v$node_lts_version/node-v$node_lts_version-linux-x64.tar.xz | tar -Jx
-PATH="./node-v$node_lts_version-linux-x64/bin:$PATH" npm install --global npm@latest n@latest
-PATH="./node-v$node_lts_version-linux-x64/bin:$PATH" n $node_version
+# Correct node version.
+npm install --global n
+n $node_version
 
 # Initialize the database.
 service mysql status || service mysql start
